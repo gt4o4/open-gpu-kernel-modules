@@ -35,8 +35,26 @@
 #include "nv_drm_common_ioctl.h"
 
 #include <linux/dma-fence.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
 #define NV_DRM_SEMAPHORE_SURFACE_FENCE_MAX_TIMEOUT_MS 5000
+
+/*
+ * PATCH(prime-fence-robustness): stock prime fences signal ONLY from the
+ * NVKMS channel-event callback. Two failure modes hang external waiters
+ * (e.g. an amdgpu reverse-PRIME sink blocking its atomic commit on our
+ * exclusive resv fence):
+ *   1. Lost event: a fence attached after its semaphore threshold already
+ *      passed is only examined on the NEXT event - which never arrives on
+ *      an idle timeline.
+ *   2. dma_fence_add_callback() waiters never enter our .wait op, so the
+ *      96 ms clamp there cannot rescue them if signaling breaks.
+ * Mirror the semaphore-surface fence design: poll pending fences from a
+ * delayed work and force-signal (-ETIMEDOUT) after a hard deadline.
+ */
+#define NV_DRM_PRIME_FENCE_POLL_INTERVAL_MS 8
+#define NV_DRM_PRIME_FENCE_MAX_TIMEOUT_MS 5000
 
 struct nv_drm_fence_context;
 
@@ -77,12 +95,23 @@ struct nv_drm_prime_fence_context {
     struct list_head pending;
 
     unsigned last_seqno;
+
+    /*
+     * PATCH(prime-fence-robustness): poll fallback for missed channel
+     * events + hard timeout. Armed whenever 'pending' is non-empty;
+     * 'poll_stop' (protected by 'lock') gates re-arming during teardown.
+     */
+    struct delayed_work poll_work;
+    bool poll_stop;
 };
 
 struct nv_drm_prime_fence {
     struct list_head list_entry;
     struct dma_fence base;
     spinlock_t lock;
+
+    /* PATCH(prime-fence-robustness): deadline base for the hard timeout */
+    unsigned long created_jiffies;
 };
 
 static inline
@@ -165,16 +194,14 @@ static void nv_drm_gem_prime_force_fence_signal(
     }
 }
 
-static void nv_drm_gem_prime_fence_event
-(
-    void *dataPtr,
-    NvU32 dataU32
-)
+/*
+ * PATCH(prime-fence-robustness): drain logic factored out of the channel
+ * event callback so it can also run at fence creation and from the poll
+ * worker. Caller must hold nv_fence_context->lock.
+ */
+static void __nv_drm_prime_fence_context_process_locked(
+    struct nv_drm_prime_fence_context *nv_fence_context)
 {
-    struct nv_drm_prime_fence_context *nv_fence_context = dataPtr;
-
-    spin_lock(&nv_fence_context->lock);
-
     while (!list_empty(&nv_fence_context->pending)) {
         struct nv_drm_prime_fence *nv_fence = list_first_entry(
             &nv_fence_context->pending,
@@ -195,6 +222,63 @@ static void nv_drm_gem_prime_fence_event
         }
 
         __nv_drm_prime_fence_signal(nv_fence);
+    }
+}
+
+static void nv_drm_gem_prime_fence_event
+(
+    void *dataPtr,
+    NvU32 dataU32
+)
+{
+    struct nv_drm_prime_fence_context *nv_fence_context = dataPtr;
+
+    spin_lock(&nv_fence_context->lock);
+
+    __nv_drm_prime_fence_context_process_locked(nv_fence_context);
+
+    spin_unlock(&nv_fence_context->lock);
+}
+
+/*
+ * PATCH(prime-fence-robustness): poll worker. Re-checks the semaphore for
+ * fences whose channel event raced or was lost, and force-signals
+ * (-ETIMEDOUT) any fence pending longer than the hard deadline so that
+ * callback-based waiters (foreign atomic commits, DRM schedulers) are
+ * guaranteed to make progress, matching the bounded-timeout guarantee of
+ * the semaphore-surface fence class.
+ */
+static void __nv_drm_prime_fence_poll_work(struct work_struct *work)
+{
+    struct nv_drm_prime_fence_context *nv_fence_context =
+        container_of(work, struct nv_drm_prime_fence_context,
+                     poll_work.work);
+
+    spin_lock(&nv_fence_context->lock);
+
+    __nv_drm_prime_fence_context_process_locked(nv_fence_context);
+
+    while (!list_empty(&nv_fence_context->pending)) {
+        struct nv_drm_prime_fence *nv_fence = list_first_entry(
+            &nv_fence_context->pending,
+            typeof(*nv_fence),
+            list_entry);
+
+        if (!time_after(jiffies,
+                        nv_fence->created_jiffies +
+                        msecs_to_jiffies(NV_DRM_PRIME_FENCE_MAX_TIMEOUT_MS))) {
+            break;
+        }
+
+        dma_fence_set_error(&nv_fence->base, -ETIMEDOUT);
+        __nv_drm_prime_fence_signal(nv_fence);
+    }
+
+    if (!nv_fence_context->poll_stop &&
+        !list_empty(&nv_fence_context->pending)) {
+        schedule_delayed_work(
+            &nv_fence_context->poll_work,
+            msecs_to_jiffies(NV_DRM_PRIME_FENCE_POLL_INTERVAL_MS));
     }
 
     spin_unlock(&nv_fence_context->lock);
@@ -217,6 +301,16 @@ static void __nv_drm_prime_fence_context_destroy(
      * callback continue to get called.
      */
     nvKms->freeChannelEvent(nv_dev->pDevice, nv_prime_fence_context->cb);
+
+    /*
+     * PATCH(prime-fence-robustness): stop the poll worker. The flag is set
+     * under the lock so a concurrently running worker cannot re-arm after
+     * cancel_delayed_work_sync() returns.
+     */
+    spin_lock(&nv_prime_fence_context->lock);
+    nv_prime_fence_context->poll_stop = true;
+    spin_unlock(&nv_prime_fence_context->lock);
+    cancel_delayed_work_sync(&nv_prime_fence_context->poll_work);
 
     /* Force signal all pending fences and empty pending list */
     spin_lock(&nv_prime_fence_context->lock);
@@ -302,6 +396,11 @@ __nv_drm_prime_fence_context_new(
 
     spin_lock_init(&nv_prime_fence_context->lock);
 
+    /* PATCH(prime-fence-robustness) */
+    INIT_DELAYED_WORK(&nv_prime_fence_context->poll_work,
+                      __nv_drm_prime_fence_poll_work);
+    nv_prime_fence_context->poll_stop = false;
+
     /*
      * Except 'cb', the fence context should be completely initialized
      * before channel event allocation because the fence context may start
@@ -374,9 +473,26 @@ static struct dma_fence *__nv_drm_prime_fence_context_create_fence(
     /* The context maintains a reference to any pending fences. */
     dma_fence_get(&nv_fence->base);
 
+    nv_fence->created_jiffies = jiffies;
+
     list_add_tail(&nv_fence->list_entry, &nv_prime_fence_context->pending);
 
     nv_prime_fence_context->last_seqno = seqno;
+
+    /*
+     * PATCH(prime-fence-robustness): the semaphore may already have passed
+     * this threshold, in which case the channel event that would have
+     * signaled us has fired (or will never fire again on an idle timeline).
+     * Drain immediately, and arm the poll fallback for whatever remains.
+     */
+    __nv_drm_prime_fence_context_process_locked(nv_prime_fence_context);
+
+    if (!nv_prime_fence_context->poll_stop &&
+        !list_empty(&nv_prime_fence_context->pending)) {
+        schedule_delayed_work(
+            &nv_prime_fence_context->poll_work,
+            msecs_to_jiffies(NV_DRM_PRIME_FENCE_POLL_INTERVAL_MS));
+    }
 
     spin_unlock(&nv_prime_fence_context->lock);
 
