@@ -2594,6 +2594,11 @@ void ConnectorImpl::populateDscSinkCaps(DSC_INFO* dscInfo, DeviceImpl * dev)
         dscInfo->sinkCaps.decoderColorDepthMask |= DSC_DECODER_COLOR_DEPTH_CAPS_8_BITS;
     }
 
+    // PATCH: force-advertise 10-bit DSC decode. The VMM5310 DPCD under-reports
+    // (0x6A=0x02 => 8-bit only), but VMM53xx silicon decodes 8/10/12 bpc per the
+    // datasheet. Without this, nvt_dsc_pps rejects 10 bpc with NVT_STATUS_INVALID_BPC.
+    dscInfo->sinkCaps.decoderColorDepthMask |= DSC_DECODER_COLOR_DEPTH_CAPS_10_BITS;
+
     dscInfo->sinkCaps.maxSliceWidth = dev->dscCaps.dscMaxSliceWidth;
     dscInfo->sinkCaps.sliceCountSupportedMask = dev->dscCaps.sliceCountSupportedMask;
     dscInfo->sinkCaps.maxNumHztSlices = dev->dscCaps.maxSlicesPerSink;
