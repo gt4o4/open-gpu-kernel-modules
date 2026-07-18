@@ -51,10 +51,17 @@
  *
  * This replaces an earlier fork patch (PATCH(prime-fence-robustness)) that gave
  * prime its own delayed_work poll: prime now rides semsurf's proven timer
- * engine, so a lost/late channel event recovers via the shared timeout instead
- * of an 8 ms poll. The lost-event race that motivated that patch (a fence
- * attached after its threshold already passed, on an idle timeline) is closed
- * at zero latency because .update drains against the live payload at attach.
+ * engine. The lost-event race that motivated that patch (a fence attached after
+ * its threshold already passed, on an idle timeline) is closed at zero latency
+ * because .update drains against the live payload at attach.
+ *
+ * Accepted delta vs the old 8 ms poll: on an *idle* timeline a genuinely lost
+ * (not merely late) channel event is now recovered by the timeout timer rather
+ * than a poll, so such a fence completes with -ETIMEDOUT after up to
+ * NV_DRM_FENCE_MAX_TIMEOUT_MS instead of an 8 ms/success re-check. NVIDIA
+ * channel events are reliable in practice, and on an active timeline the next
+ * event/attach drains it within a frame, so this is a corner case; the win is
+ * no per-frame poll wakeups and one shared engine.
  */
 
 #include "nvidia-drm-conftest.h"
@@ -91,9 +98,9 @@ struct nv_drm_fence_context_ops {
     void (*destroy)(struct nv_drm_fence_context *nv_fence_context);
 
     /*
-     * Read the context's current completion payload. Called with no lock held
-     * (and, transitively, under ctx->lock via the drain); must be non-blocking
-     * and safe from any context.
+     * Read the context's current completion payload. Called with no lock held,
+     * just before the drain takes ctx->lock; must be non-blocking (a plain
+     * READ_ONCE) and safe from any context.
      */
     NvU64 (*read_seqno)(struct nv_drm_fence_context *nv_fence_context);
 
@@ -248,28 +255,34 @@ __nv_drm_fence_context_process(struct nv_drm_fence_context *ctx,
     }
 
     /*
-     * See the re-arm contract in the function comment.
+     * See the re-arm contract in the function comment. NOTE: the timer deadline
+     * (*newTimeoutOut) is decoupled from the RM-callback dedup (*newWaitValueOut):
+     * the timeout timer must always track the earliest (head) pending fence, so
+     * that a reordered stale mod_timer cannot permanently drop the backstop --
+     * only the (expensive) backend wakeup registration is deduped.
      */
     if (newWaitValueOut && newTimeoutOut) {
         if (list_empty(&ctx->pending_fences)) {
-            /* No pending fences, so no wakeup is needed. */
-            ctx->current_wait_value = fenceSeqno = 0;
-            fenceTimeout = 0;
-        } else if (fenceSeqno == ctx->current_wait_value) {
-            /*
-             * A wakeup is already registered, or in the process of being
-             * registered, for this fence. Tell the caller nothing new is
-             * needed and leave the ctx state alone.
-             */
-            fenceSeqno = 0;
-            fenceTimeout = 0;
+            /* No pending fences: no wakeup and no timer. */
+            ctx->current_wait_value = 0;
+            *newWaitValueOut = 0;
+            *newTimeoutOut = 0;
         } else {
-            /* A new wakeup must be armed. Prep the context. */
-            ctx->current_wait_value = fenceSeqno;
-        }
+            /* Timer always tracks the head deadline. */
+            *newTimeoutOut = fenceTimeout;
 
-        *newWaitValueOut = fenceSeqno;
-        *newTimeoutOut = fenceTimeout;
+            if (fenceSeqno == ctx->current_wait_value) {
+                /*
+                 * A backend wakeup is already registered, or in the process of
+                 * being registered, for this fence -- no new one is needed.
+                 */
+                *newWaitValueOut = 0;
+            } else {
+                /* A new backend wakeup must be registered. Prep the context. */
+                ctx->current_wait_value = fenceSeqno;
+                *newWaitValueOut = fenceSeqno;
+            }
+        }
     }
 
     spin_unlock_irqrestore(&ctx->lock, flags);
@@ -341,7 +354,7 @@ __nv_drm_fence_context_add_pending(struct nv_drm_fence_context *ctx,
     struct list_head *pending;
     unsigned long flags;
 
-    if (timeoutMS > NV_DRM_FENCE_MAX_TIMEOUT_MS) {
+    if (timeoutMS == 0 || timeoutMS > NV_DRM_FENCE_MAX_TIMEOUT_MS) {
         timeoutMS = NV_DRM_FENCE_MAX_TIMEOUT_MS;
     }
 
@@ -658,12 +671,17 @@ __nv_drm_prime_fence_ctx_update(struct nv_drm_fence_context *nv_fence_context)
 
     /*
      * Drain anything the channel event / semaphore has completed, and (re)arm
-     * the timeout timer for the earliest remaining fence. Prime's channel event
-     * is always live, so there is no callback to (re)register here.
+     * the timeout timer to the earliest remaining fence's deadline. Prime's
+     * channel event is always live, so the RM-registration signal
+     * (newWaitValue) is unused here; the timer is keyed to the head deadline
+     * (newTimeout), so a reordered stale arm self-heals on the next fire rather
+     * than dropping the backstop. Called only from the worker and from create
+     * (never the channel event), so mod_timer cannot race teardown's
+     * del_timer_sync.
      */
     __nv_drm_fence_context_process(nv_fence_context, &newWaitValue, &newTimeout);
 
-    if (newWaitValue != 0) {
+    if (newTimeout != 0) {
         nv_drm_mod_timer(&nv_fence_context->timer, newTimeout);
     }
 }
@@ -675,8 +693,16 @@ static void nv_drm_gem_prime_fence_event
 )
 {
     struct nv_drm_prime_fence_context *nv_prime_fence_context = dataPtr;
+    struct nv_drm_fence_context *ctx = &nv_prime_fence_context->base;
 
-    __nv_drm_prime_fence_ctx_update(&nv_prime_fence_context->base);
+    /*
+     * Signal any completed fences immediately (low latency for the waiting
+     * sink), but do NOT arm the timer from this NVKMS event context: defer the
+     * (re-)arm to the worker, which teardown drains before del_timer_sync, so no
+     * mod_timer can outlive the fence context. Mirrors the semsurf callback.
+     */
+    __nv_drm_fence_context_process(ctx, NULL, NULL);
+    nv_drm_workthread_add_work(&ctx->worker, &ctx->timeout_work);
 }
 
 static void __nv_drm_prime_fence_context_destroy(
@@ -817,7 +843,8 @@ static struct dma_fence *__nv_drm_prime_fence_context_create_fence(
 {
     struct nv_drm_fence_context *ctx = &nv_prime_fence_context->base;
     struct nv_drm_fence *nv_fence;
-    bool wrapped;
+    struct nv_drm_fence *wrapped_fence;
+    struct list_head wrapped;
     unsigned long flags;
     int ret = 0;
 
@@ -826,18 +853,7 @@ static struct dma_fence *__nv_drm_prime_fence_context_create_fence(
         goto out;
     }
 
-    /*
-     * If seqno wrapped, force signal outstanding fences so none of them get
-     * stuck behind the new (smaller) seqno in the sorted pending list.
-     */
-    spin_lock_irqsave(&ctx->lock, flags);
-    wrapped = (seqno < nv_prime_fence_context->last_seqno);
-    nv_prime_fence_context->last_seqno = seqno;
-    spin_unlock_irqrestore(&ctx->lock, flags);
-
-    if (wrapped) {
-        __nv_drm_fence_context_force_complete(ctx, 0);
-    }
+    INIT_LIST_HEAD(&wrapped);
 
     spin_lock_init(&nv_fence->lock);
 #if !defined(NV_DMA_FENCE_OPS_HAS_USE_64BIT_SEQNO)
@@ -847,14 +863,43 @@ static struct dma_fence *__nv_drm_prime_fence_context_create_fence(
     dma_fence_init(&nv_fence->base, &nv_drm_gem_prime_fence_ops,
                    &nv_fence->lock, ctx->context, seqno);
 
+    /* The pending list holds a reference. */
+    dma_fence_get(&nv_fence->base);
+    INIT_LIST_HEAD(&nv_fence->pending_node);
+    nv_fence->timeout = nv_drm_timeout_from_ms(NV_DRM_FENCE_MAX_TIMEOUT_MS);
+
+    spin_lock_irqsave(&ctx->lock, flags);
     /*
-     * The semaphore may already have passed this threshold, in which case the
-     * channel event that would have signaled us has fired (or will never fire
-     * again on an idle timeline). add_pending drains immediately and arms the
-     * timeout, so the fence cannot get stuck.
+     * If seqno wrapped, collect the outstanding fences so none get stuck behind
+     * the new (smaller) seqno in the ordered list. The flush-collect and the
+     * insert happen under one lock hold, so a concurrent creator cannot slip a
+     * fence into the window and have it wrongly force-completed.
      */
-    __nv_drm_fence_context_add_pending(ctx, nv_fence,
-                                       NV_DRM_FENCE_MAX_TIMEOUT_MS);
+    if (seqno < nv_prime_fence_context->last_seqno) {
+        list_splice_init(&ctx->pending_fences, &wrapped);
+        ctx->current_wait_value = 0;
+    }
+    nv_prime_fence_context->last_seqno = seqno;
+    /* Prime seqnos are monotonic (post-flush), so the new fence is the tail. */
+    list_add_tail(&nv_fence->pending_node, &ctx->pending_fences);
+    spin_unlock_irqrestore(&ctx->lock, flags);
+
+    /* Signal any wrapped-out fences (success, no error) outside the lock. */
+    while (!list_empty(&wrapped)) {
+        wrapped_fence = list_first_entry(&wrapped, typeof(*wrapped_fence),
+                                         pending_node);
+        list_del_init(&wrapped_fence->pending_node);
+        dma_fence_signal(&wrapped_fence->base);
+        dma_fence_put(&wrapped_fence->base); /* drops the pending list ref */
+    }
+
+    /*
+     * The semaphore may already have passed this threshold (the channel event
+     * that would have signaled us has fired, or will never fire again on an idle
+     * timeline). update() drains immediately and arms the timeout, so the fence
+     * cannot get stuck.
+     */
+    ctx->ops->update(ctx);
 
 out:
     return ret != 0 ? ERR_PTR(ret) : &nv_fence->base;
@@ -866,7 +911,6 @@ int nv_drm_prime_fence_context_create_ioctl(struct drm_device *dev,
     struct nv_drm_device *nv_dev = to_nv_device(dev);
     struct drm_nvidia_prime_fence_context_create_params *p = data;
     struct nv_drm_prime_fence_context *nv_prime_fence_context;
-    int err;
 
     if (nv_dev->pDevice == NULL) {
         return -EOPNOTSUPP;
@@ -875,21 +919,18 @@ int nv_drm_prime_fence_context_create_ioctl(struct drm_device *dev,
     nv_prime_fence_context = __nv_drm_prime_fence_context_new(nv_dev, p);
 
     if (!nv_prime_fence_context) {
-        goto done;
+        return -ENOMEM;
     }
 
-    err = __nv_drm_fence_context_gem_init(dev,
-                                          &nv_prime_fence_context->base,
-                                          &p->handle,
-                                          filep);
-    if (err) {
-        __nv_drm_prime_fence_context_destroy(&nv_prime_fence_context->base);
-    }
-
-    return err;
-
-done:
-    return -ENOMEM;
+    /*
+     * On failure, handle-create has already dropped the only reference, which
+     * frees the context via gem_free -> ops->destroy. Do NOT destroy again here
+     * (that would be a double-free); just return the error.
+     */
+    return __nv_drm_fence_context_gem_init(dev,
+                                           &nv_prime_fence_context->base,
+                                           &p->handle,
+                                           filep);
 }
 
 int nv_drm_gem_prime_fence_attach_ioctl(struct drm_device *dev,
@@ -1223,8 +1264,18 @@ __nv_drm_semsurf_ctx_reg_callbacks(struct nv_drm_semsurf_fence_ctx *ctx)
                                        &newWaitValue,
                                        &newTimeout);
 
+        /*
+         * Keep the timeout timer armed to the head deadline whenever a fence is
+         * pending, even when no NEW callback registration is needed (deduped) or
+         * the list just drained. Decoupling the timer from the callback dedup
+         * prevents a reordered stale mod_timer from dropping the backstop.
+         */
+        if (newTimeout != 0) {
+            nv_drm_mod_timer(&ctx->base.timer, newTimeout);
+        }
+
         if (newWaitValue == 0) {
-            /* No fences remain, so no callback is needed. */
+            /* No new callback needed (list empty, or one is already registered). */
             nv_drm_free(newCallback);
             newCallback = NULL;
             return;
@@ -1271,7 +1322,7 @@ __nv_drm_semsurf_ctx_reg_callbacks(struct nv_drm_semsurf_fence_ctx *ctx)
         return;
     }
 
-    nv_drm_mod_timer(&ctx->base.timer, newTimeout);
+    /* The timeout timer was already (re)armed to the head deadline above. */
 
     if (!__nv_drm_semsurf_ctx_store_callback(ctx,
                                              newWaitValue,
@@ -1480,7 +1531,6 @@ int nv_drm_semsurf_fence_ctx_create_ioctl(struct drm_device *dev,
     struct nv_drm_device *nv_dev = to_nv_device(dev);
     struct drm_nvidia_semsurf_fence_ctx_create_params *p = data;
     struct nv_drm_semsurf_fence_ctx *ctx;
-    int err;
 
     if (nv_dev->pDevice == NULL) {
         return -EOPNOTSUPP;
@@ -1497,13 +1547,12 @@ int nv_drm_semsurf_fence_ctx_create_ioctl(struct drm_device *dev,
         return -ENOMEM;
     }
 
-    err = __nv_drm_fence_context_gem_init(dev, &ctx->base, &p->handle, filep);
-
-    if (err) {
-        __nv_drm_semsurf_fence_ctx_destroy(&ctx->base);
-    }
-
-    return err;
+    /*
+     * On failure, handle-create has already dropped the only reference, which
+     * frees the context via gem_free -> ops->destroy. Do NOT destroy again here
+     * (that would be a double-free); just return the error.
+     */
+    return __nv_drm_fence_context_gem_init(dev, &ctx->base, &p->handle, filep);
 }
 
 static const char*
