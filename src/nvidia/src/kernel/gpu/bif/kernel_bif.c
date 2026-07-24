@@ -887,6 +887,26 @@ kbifCheckAndRearmMSI_IMPL
             if (pKernelBif->getProperty(pKernelBif, PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI))
             {
                 kbifRearmMSI_HAL(pGpu, pKernelBif);
+
+                //
+                // PATCH(msi-rearm) [gt4o4 fork]: after the config-space EOI,
+                // also force a top-level retrigger, exactly as the MSI-X branch
+                // below and the non-config-space chips (GH100+) already do.
+                //
+                // The nonstall interrupt subtree is serviced in a single
+                // lockless pass with no deferred re-scan, and - unlike the
+                // stall subtree - its top-level enables are not toggled on RM
+                // lock release. On config-space-EOI chips (e.g. GA10x) a leaf
+                // that latches during/after that single pass therefore has no
+                // guaranteed re-delivery edge, and a semaphore-notification
+                // interrupt can be swallowed until unrelated GPU activity
+                // raises the next one. intrRetriggerTopLevel toggles the
+                // nonstall subtree top enables (clear -> set), forcing any
+                // still-pending leaf to generate a fresh (now re-armed)
+                // message. Ordering: EOI first, then retrigger, so the
+                // retriggered edge lands on a re-armed MSI.
+                //
+                intrRetriggerTopLevel_HAL(pGpu, pIntr);
             }
             else
             {
