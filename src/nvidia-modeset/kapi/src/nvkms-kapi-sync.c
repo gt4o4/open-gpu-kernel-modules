@@ -31,7 +31,9 @@
 
 #include "class/cl0000.h"
 #include "class/cl0005.h"
+#include "class/cl2080.h" /* cl2080_notification.h: NV2080_NOTIFIERS_FIFO_EVENT_MTHD */
 #include "ctrl/ctrl00da.h"
+#include "ctrl/ctrl2080/ctrl2080event.h" /* NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION */
 
 struct NvKmsKapiChannelEvent {
     struct NvKmsKapiDevice *device;
@@ -43,6 +45,22 @@ struct NvKmsKapiChannelEvent {
 
     NvHandle hCallbacks[NVKMS_KAPI_MAX_EVENT_CHANNELS];
     NVOS10_EVENT_KERNEL_CALLBACK_EX rmCallback;
+
+    /*
+     * PATCH(prime-nonstall-wakeup) [gt4o4 fork]: a second, redundant wakeup
+     * source for the same consumer. The per-channel events above are notified
+     * by GSP-RM (POST_EVENT RPC) when the channel's semaphore release with
+     * AWAKEN executes; if that firmware-originated notification is lost, no
+     * CPU-side code ever re-checks the semaphore. The same semaphore release
+     * also raises the host (FIFO_EVENT_MTHD) nonstall interrupt, which is
+     * serviced by CPU-RM directly. Register a subdevice-parented kernel
+     * callback on that notifier as a GSP-independent second delivery path.
+     * The consumer's callback is level-triggered (re-reads the semaphore
+     * payload and completes everything reached), so duplicate or unrelated
+     * notifications are harmless.
+     */
+    NvHandle hNonStallCallback;
+    NVOS10_EVENT_KERNEL_CALLBACK_EX nonStallRmCallback;
 };
 
 static void ChannelEventHandler(void *arg1, void *arg2, NvHandle hEvent,
@@ -50,6 +68,107 @@ static void ChannelEventHandler(void *arg1, void *arg2, NvHandle hEvent,
 {
     struct NvKmsKapiChannelEvent *cb = arg1;
     cb->proc(cb->data, 0);
+}
+
+static void ChannelEventNonStallHandler(void *arg1, void *arg2,
+                                        NvHandle hEvent,
+                                        NvU32 data, NvU32 status)
+{
+    struct NvKmsKapiChannelEvent *cb = arg1;
+    /* dataU32 = 1 tells the consumer this is the nonstall (fallback) path. */
+    cb->proc(cb->data, 1);
+}
+
+static void FreeChannelEventNonStall
+(
+    struct NvKmsKapiDevice *device,
+    struct NvKmsKapiChannelEvent *cb
+)
+{
+    NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS setParams = { };
+
+    if (!cb->hNonStallCallback) {
+        return;
+    }
+
+    setParams.event = NV2080_NOTIFIERS_FIFO_EVENT_MTHD;
+    setParams.action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_DISABLE;
+    nvRmApiControl(device->hRmClient,
+                   device->hRmSubDevice,
+                   NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
+                   &setParams,
+                   sizeof(setParams));
+
+    nvRmApiFree(device->hRmClient,
+                device->hRmClient,
+                cb->hNonStallCallback);
+
+    nvFreeUnixRmHandle(&device->handleAllocator, cb->hNonStallCallback);
+
+    cb->hNonStallCallback = 0;
+}
+
+/*
+ * Best-effort: the channel events above remain the primary signal path; if
+ * this redundant registration fails the caller proceeds without it.
+ */
+static void AllocChannelEventNonStall
+(
+    struct NvKmsKapiDevice *device,
+    struct NvKmsKapiChannelEvent *cb
+)
+{
+    NV0005_ALLOC_PARAMETERS eventParams = { };
+    NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS setParams = { };
+    NvU32 ret;
+
+    cb->nonStallRmCallback.func = ChannelEventNonStallHandler;
+    cb->nonStallRmCallback.arg = cb;
+
+    cb->hNonStallCallback = nvGenerateUnixRmHandle(&device->handleAllocator);
+    if (cb->hNonStallCallback == 0x0) {
+        nvKmsKapiLogDeviceDebug(device,
+            "Failed to allocate nonstall event callback handle");
+        return;
+    }
+
+    eventParams.hParentClient = device->hRmClient;
+    eventParams.hClass = NV01_EVENT_KERNEL_CALLBACK_EX;
+    eventParams.notifyIndex = NV2080_NOTIFIERS_FIFO_EVENT_MTHD |
+                              NV01_EVENT_NONSTALL_INTR |
+                              NV01_EVENT_WITHOUT_EVENT_DATA;
+    eventParams.data = NV_PTR_TO_NvP64(&cb->nonStallRmCallback);
+
+    ret = nvRmApiAlloc(device->hRmClient,
+                       device->hRmSubDevice,
+                       cb->hNonStallCallback,
+                       NV01_EVENT_KERNEL_CALLBACK_EX,
+                       &eventParams);
+    if (ret != NVOS_STATUS_SUCCESS) {
+        nvKmsKapiLogDeviceDebug(device,
+            "Failed to allocate nonstall event callback");
+        nvFreeUnixRmHandle(&device->handleAllocator, cb->hNonStallCallback);
+        cb->hNonStallCallback = 0;
+        return;
+    }
+
+    setParams.event = NV2080_NOTIFIERS_FIFO_EVENT_MTHD;
+    setParams.action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT;
+
+    ret = nvRmApiControl(device->hRmClient,
+                         device->hRmSubDevice,
+                         NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
+                         &setParams,
+                         sizeof(setParams));
+    if (ret != NVOS_STATUS_SUCCESS) {
+        nvKmsKapiLogDeviceDebug(device,
+            "Failed to enable nonstall event notification");
+        nvRmApiFree(device->hRmClient,
+                    device->hRmClient,
+                    cb->hNonStallCallback);
+        nvFreeUnixRmHandle(&device->handleAllocator, cb->hNonStallCallback);
+        cb->hNonStallCallback = 0;
+    }
 }
 
 void nvKmsKapiFreeChannelEvent
@@ -63,6 +182,8 @@ void nvKmsKapiFreeChannelEvent
     if (device == NULL || cb == NULL) {
         return;
     }
+
+    FreeChannelEventNonStall(device, cb);
 
     for (i = 0; i < NVKMS_KAPI_MAX_EVENT_CHANNELS; ++i) {
         if (!cb->hCallbacks[i]) {
@@ -163,6 +284,8 @@ struct NvKmsKapiChannelEvent* nvKmsKapiAllocateChannelEvent
             goto fail;
         }
     }
+
+    AllocChannelEventNonStall(device, cb);
 
     return cb;
 
