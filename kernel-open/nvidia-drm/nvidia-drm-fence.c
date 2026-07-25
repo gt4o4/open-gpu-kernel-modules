@@ -52,6 +52,27 @@
  * A fence attached after its threshold has already passed (e.g. on an idle
  * timeline whose completion event fired long ago) is drained at zero latency:
  * .update reads the live payload at attach and arms the timeout for the rest.
+ *
+ * PATCH(prime-nonstall-wakeup) [gt4o4 fork]:
+ *
+ * Genuinely losing a channel event is real on GSP systems: the prime channel
+ * event originates in GSP-RM firmware (POST_EVENT RPC), and losing the one
+ * for the last frame before the timeline goes idle left the fence stalled on
+ * the timeout timer (observed as occasional multi-second reverse-PRIME
+ * freezes that self-recover; measured at ~1 lost event per 12,000 on GA104).
+ * Two changes:
+ *
+ *   - The KAPI (nvkms-kapi-sync.c) now additionally registers a subdevice
+ *     nonstall-interrupt callback (FIFO_EVENT_MTHD) for the same consumer,
+ *     delivered with dataU32 == 1. The host nonstall interrupt is raised by
+ *     the very same semaphore-release-with-AWAKEN and is serviced by CPU-RM
+ *     directly, so it is a GSP-independent second wakeup. The prime event
+ *     handler drains on it too (cheap empty-peek first, since it also fires
+ *     for unrelated host traffic).
+ *
+ *   - Delivery diagnostics: per-context counters for channel-event vs
+ *     nonstall deliveries, and a sparse log when fences complete only via the
+ *     timer path (i.e. both event paths missed) -- previously silent.
  */
 
 #include "nvidia-drm-conftest.h"
@@ -69,6 +90,7 @@
 #include "nv_drm_common_ioctl.h"
 
 #include <linux/dma-fence.h>
+#include <linux/atomic.h>
 
 #ifndef READ_ONCE
 #define READ_ONCE(x) ACCESS_ONCE(x)
@@ -96,10 +118,14 @@ struct nv_drm_fence_context_ops {
 
     /*
      * Drain completed/timed-out fences and (re)arm the backend's wakeup for the
-     * next pending fence, if any. Runs in process context (workthread / ioctl /
-     * channel-event); never called with ctx->lock held.
+     * next pending fence, if any. Runs in process context (workthread / ioctl);
+     * never called with ctx->lock held. 'timer_initiated' is true when this
+     * call was triggered by the timeout timer firing (as opposed to fence
+     * creation or an event-deferred re-arm) -- diagnostics only; backends may
+     * ignore it.
      */
-    void (*update)(struct nv_drm_fence_context *nv_fence_context);
+    void (*update)(struct nv_drm_fence_context *nv_fence_context,
+                   NvBool timer_initiated);
 };
 
 struct nv_drm_fence_context {
@@ -128,6 +154,12 @@ struct nv_drm_fence_context {
      * to dedupe redundant re-arms. See __nv_drm_fence_context_process().
      */
     NvU64 current_wait_value;
+
+    /*
+     * Latched by the timer callback, consumed (xchg 0) by the worker before it
+     * calls ops->update, so update() knows the drain was timer-initiated.
+     */
+    atomic_t timer_fired;
 };
 
 struct nv_drm_fence {
@@ -193,6 +225,12 @@ static void __nv_drm_fence_op_release(struct dma_fence *fence)
  * Shared timeline engine
  *==========================================================================*/
 
+/* Optional per-drain outcome counts, for delivery diagnostics. */
+struct nv_drm_fence_drain_stats {
+    unsigned int nSignaled;  /* payload reached: signaled success */
+    unsigned int nTimedOut;  /* deadline passed: force-signaled -ETIMEDOUT */
+};
+
 /*
  * Drain the pending list: signal every head fence whose payload has been
  * reached (no error), and force-signal (-ETIMEDOUT) every head fence past its
@@ -210,7 +248,8 @@ static void __nv_drm_fence_op_release(struct dma_fence *fence)
 static void
 __nv_drm_fence_context_process(struct nv_drm_fence_context *ctx,
                                NvU64 *newWaitValueOut,
-                               unsigned long *newTimeoutOut)
+                               unsigned long *newTimeoutOut,
+                               struct nv_drm_fence_drain_stats *statsOut)
 {
     struct list_head finished;
     struct list_head timed_out;
@@ -224,6 +263,11 @@ __nv_drm_fence_context_process(struct nv_drm_fence_context *ctx,
 
     INIT_LIST_HEAD(&finished);
     INIT_LIST_HEAD(&timed_out);
+
+    if (statsOut) {
+        statsOut->nSignaled = 0;
+        statsOut->nTimedOut = 0;
+    }
 
     spin_lock_irqsave(&ctx->lock, flags);
 
@@ -283,6 +327,9 @@ __nv_drm_fence_context_process(struct nv_drm_fence_context *ctx,
         fence = &nv_fence->base;
         dma_fence_signal(fence);
         dma_fence_put(fence); /* Drops the pending list's reference */
+        if (statsOut) {
+            statsOut->nSignaled++;
+        }
     }
 
     while (!list_empty(&timed_out)) {
@@ -293,6 +340,9 @@ __nv_drm_fence_context_process(struct nv_drm_fence_context *ctx,
         dma_fence_set_error(fence, -ETIMEDOUT);
         dma_fence_signal(fence);
         dma_fence_put(fence); /* Drops the pending list's reference */
+        if (statsOut) {
+            statsOut->nTimedOut++;
+        }
     }
 }
 
@@ -379,7 +429,7 @@ __nv_drm_fence_context_add_pending(struct nv_drm_fence_context *ctx,
     spin_unlock_irqrestore(&ctx->lock, flags);
 
     /* Drain anything already complete and (re)arm the wakeup. */
-    ctx->ops->update(ctx);
+    ctx->ops->update(ctx, NV_FALSE);
 }
 
 static void
@@ -387,7 +437,14 @@ __nv_drm_fence_context_timeout_work(void *data)
 {
     struct nv_drm_fence_context *ctx = data;
 
-    ctx->ops->update(ctx);
+    /*
+     * Consume the timer latch: this pass is timer-initiated iff the timeout
+     * timer fired since the last worker pass (as opposed to an event handler
+     * deferring a re-arm here).
+     */
+    NvBool timer_initiated = (atomic_xchg(&ctx->timer_fired, 0) != 0);
+
+    ctx->ops->update(ctx, timer_initiated);
 }
 
 static void
@@ -405,6 +462,7 @@ __nv_drm_fence_context_timeout_callback(nv_drm_timer *timer)
      * The worker must be shut down before the timer during teardown so this
      * cannot re-arm a timer that is being idled.
      */
+    atomic_set(&ctx->timer_fired, 1);
     nv_drm_workthread_add_work(&ctx->worker, &ctx->timeout_work);
 }
 
@@ -430,6 +488,7 @@ __nv_drm_fence_context_init(struct nv_drm_fence_context *ctx,
     ctx->context = dma_fence_context_alloc(1);
     ctx->fenceSemIndex = fenceSemIndex;
     ctx->current_wait_value = 0;
+    atomic_set(&ctx->timer_fired, 0);
 
     spin_lock_init(&ctx->lock);
     INIT_LIST_HEAD(&ctx->pending_fences);
@@ -617,6 +676,17 @@ struct nv_drm_prime_fence_context {
 
     /* Last seqno handed out, for 32-bit wrap detection. */
     unsigned last_seqno;
+
+    /*
+     * Delivery diagnostics (PATCH(prime-nonstall-wakeup)). The event handler
+     * runs concurrently with the worker, so these are lock-free atomics.
+     */
+    atomic_long_t stat_channel_events;   /* GSP channel-event deliveries */
+    atomic_long_t stat_nonstall_kicks;   /* nonstall deliveries, fences pending */
+    atomic_long_t stat_nonstall_idle;    /* nonstall deliveries, list empty */
+    atomic_long_t stat_timer_recoveries; /* fences completed only by the timer */
+    atomic_long_t stat_timeouts;         /* fences force-completed -ETIMEDOUT */
+    NvBool nonstall_live_logged;         /* one-time "path is live" log gate */
 };
 
 static inline struct nv_drm_prime_fence_context*
@@ -654,8 +724,12 @@ __nv_drm_prime_fence_ctx_read_seqno(struct nv_drm_fence_context *nv_fence_contex
 }
 
 static void
-__nv_drm_prime_fence_ctx_update(struct nv_drm_fence_context *nv_fence_context)
+__nv_drm_prime_fence_ctx_update(struct nv_drm_fence_context *nv_fence_context,
+                                NvBool timer_initiated)
 {
+    struct nv_drm_prime_fence_context *prime_ctx =
+        to_nv_prime_fence_context(nv_fence_context);
+    struct nv_drm_fence_drain_stats stats;
     NvU64 newWaitValue;
     unsigned long newTimeout;
 
@@ -666,10 +740,45 @@ __nv_drm_prime_fence_ctx_update(struct nv_drm_fence_context *nv_fence_context)
      * (newWaitValue) is unused here; the timer is keyed to the head deadline
      * (newTimeout), so a reordered stale arm self-heals on the next fire rather
      * than dropping the backstop. Called only from the worker and from create
-     * (never the channel event), so mod_timer cannot race teardown's
+     * (never the event handlers), so mod_timer cannot race teardown's
      * del_timer_sync.
      */
-    __nv_drm_fence_context_process(nv_fence_context, &newWaitValue, &newTimeout);
+    __nv_drm_fence_context_process(nv_fence_context, &newWaitValue, &newTimeout,
+                                   &stats);
+
+    /*
+     * Diagnostics: a fence completing in a TIMER-initiated drain means both
+     * event paths (GSP channel event and CPU nonstall broadcast) missed it and
+     * the waiting sink stalled until the timer deadline. Log sparsely -- this
+     * was previously silent.
+     */
+    if (timer_initiated && stats.nSignaled != 0) {
+        long n = atomic_long_add_return(stats.nSignaled,
+                                        &prime_ctx->stat_timer_recoveries);
+        if (n <= 8 || (n % 64) == 0) {
+            NV_DRM_DEV_LOG_INFO(
+                nv_fence_context->nv_dev,
+                "prime fence: %u fence(s) completed only by the timeout timer "
+                "(payload had advanced, both event paths missed); "
+                "totals: timer=%ld ch_ev=%ld ns_kick=%ld ns_idle=%ld",
+                stats.nSignaled, n,
+                atomic_long_read(&prime_ctx->stat_channel_events),
+                atomic_long_read(&prime_ctx->stat_nonstall_kicks),
+                atomic_long_read(&prime_ctx->stat_nonstall_idle));
+        }
+    }
+
+    if (stats.nTimedOut != 0) {
+        long n = atomic_long_add_return(stats.nTimedOut,
+                                        &prime_ctx->stat_timeouts);
+        if (n <= 8 || (n % 64) == 0) {
+            NV_DRM_DEV_LOG_ERR(
+                nv_fence_context->nv_dev,
+                "prime fence: %u fence(s) timed out (-ETIMEDOUT, payload never "
+                "advanced); total: %ld",
+                stats.nTimedOut, n);
+        }
+    }
 
     if (newTimeout != 0) {
         nv_drm_mod_timer(&nv_fence_context->timer, newTimeout);
@@ -685,13 +794,46 @@ static void nv_drm_gem_prime_fence_event
     struct nv_drm_prime_fence_context *nv_prime_fence_context = dataPtr;
     struct nv_drm_fence_context *ctx = &nv_prime_fence_context->base;
 
+    if (dataU32 != 0) {
+        /*
+         * Redundant nonstall-broadcast delivery (PATCH(prime-nonstall-wakeup),
+         * see nvkms-kapi-sync.c): raised by the same semaphore release as the
+         * channel event, but serviced by CPU-RM independent of GSP. It also
+         * fires for unrelated host nonstall traffic, so peek first: on an idle
+         * timeline the cost is one spinlock + list_empty.
+         */
+        unsigned long flags;
+        bool have_pending;
+
+        if (!nv_prime_fence_context->nonstall_live_logged) {
+            /* Benign race: at most a duplicate log line. */
+            nv_prime_fence_context->nonstall_live_logged = NV_TRUE;
+            NV_DRM_DEV_LOG_INFO(
+                ctx->nv_dev,
+                "prime fence: redundant nonstall wakeup path is live");
+        }
+
+        spin_lock_irqsave(&ctx->lock, flags);
+        have_pending = !list_empty(&ctx->pending_fences);
+        spin_unlock_irqrestore(&ctx->lock, flags);
+
+        if (!have_pending) {
+            atomic_long_inc(&nv_prime_fence_context->stat_nonstall_idle);
+            return;
+        }
+
+        atomic_long_inc(&nv_prime_fence_context->stat_nonstall_kicks);
+    } else {
+        atomic_long_inc(&nv_prime_fence_context->stat_channel_events);
+    }
+
     /*
      * Signal any completed fences immediately (low latency for the waiting
      * sink), but do NOT arm the timer from this NVKMS event context: defer the
      * (re-)arm to the worker, which teardown drains before del_timer_sync, so no
      * mod_timer can outlive the fence context. Mirrors the semsurf callback.
      */
-    __nv_drm_fence_context_process(ctx, NULL, NULL);
+    __nv_drm_fence_context_process(ctx, NULL, NULL, NULL);
     nv_drm_workthread_add_work(&ctx->worker, &ctx->timeout_work);
 }
 
@@ -890,7 +1032,7 @@ static struct dma_fence *__nv_drm_prime_fence_context_create_fence(
      * timeline). update() drains immediately and arms the timeout, so the fence
      * cannot get stuck.
      */
-    ctx->ops->update(ctx);
+    ctx->ops->update(ctx, NV_FALSE);
 
 out:
     return ret != 0 ? ERR_PTR(ret) : &nv_fence->base;
@@ -1096,8 +1238,10 @@ static void
 __nv_drm_semsurf_ctx_reg_callbacks(struct nv_drm_semsurf_fence_ctx *ctx);
 
 static void
-__nv_drm_semsurf_ctx_update(struct nv_drm_fence_context *nv_fence_context)
+__nv_drm_semsurf_ctx_update(struct nv_drm_fence_context *nv_fence_context,
+                            NvBool timer_initiated)
 {
+    /* timer_initiated is diagnostics-only; semsurf does not use it. */
     __nv_drm_semsurf_ctx_reg_callbacks(to_semsurf_fence_ctx(nv_fence_context));
 }
 
@@ -1154,7 +1298,7 @@ __nv_drm_semsurf_ctx_callback(void *data)
      * work enqueued below, but calling it here as well allows unblocking
      * waiters with less latency.
      */
-    __nv_drm_fence_context_process(&ctx->base, NULL, NULL);
+    __nv_drm_fence_context_process(&ctx->base, NULL, NULL, NULL);
 
     if (!nv_drm_workthread_add_work(&ctx->base.worker, &callback->work)) {
         /*
@@ -1253,7 +1397,8 @@ __nv_drm_semsurf_ctx_reg_callbacks(struct nv_drm_semsurf_fence_ctx *ctx)
          */
         __nv_drm_fence_context_process(&ctx->base,
                                        &newWaitValue,
-                                       &newTimeout);
+                                       &newTimeout,
+                                       NULL);
 
         /*
          * Keep the timeout timer armed to the head deadline whenever a fence is
