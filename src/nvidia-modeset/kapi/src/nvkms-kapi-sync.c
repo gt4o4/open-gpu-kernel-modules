@@ -85,20 +85,19 @@ static void FreeChannelEventNonStall
     struct NvKmsKapiChannelEvent *cb
 )
 {
-    NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS setParams = { };
-
     if (!cb->hNonStallCallback) {
         return;
     }
 
-    setParams.event = NV2080_NOTIFIERS_FIFO_EVENT_MTHD;
-    setParams.action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_DISABLE;
-    nvRmApiControl(device->hRmClient,
-                   device->hRmSubDevice,
-                   NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
-                   &setParams,
-                   sizeof(setParams));
-
+    /*
+     * Do NOT send NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION(DISABLE) here: the
+     * notifyActions[] arming state lives on the shared subdevice object
+     * (subdevice_ctrl_event_kernel.c), so disabling it would silence every
+     * other fence context's event on this device. Freeing the event object is
+     * sufficient - it removes this callback from the engine notification
+     * list. The subdevice-level arming intentionally stays REPEAT for the
+     * device's lifetime (see AllocChannelEventNonStall).
+     */
     nvRmApiFree(device->hRmClient,
                 device->hRmClient,
                 cb->hNonStallCallback);
@@ -160,7 +159,21 @@ static void AllocChannelEventNonStall
                          NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
                          &setParams,
                          sizeof(setParams));
-    if (ret != NVOS_STATUS_SUCCESS) {
+
+    /*
+     * The notifyActions[] arming is per shared subdevice object, and RM
+     * rejects an armed->armed transition with INVALID_STATE
+     * (subdevice_ctrl_event_kernel.c) - which is exactly what a second fence
+     * context on this device sees, since the first one already armed REPEAT
+     * and teardown deliberately never disables it. That is success for our
+     * purposes: the nonstall engine-list delivery calls every registered
+     * event unconditionally (event_notification.c,
+     * _gpuEngineEventNotificationListNotify), so this context's event fires
+     * as long as it stays allocated. (sem_surf.c registers the identical
+     * event type without any SET_NOTIFICATION at all.)
+     */
+    if (ret != NVOS_STATUS_SUCCESS &&
+        ret != NVOS_STATUS_ERROR_INVALID_STATE) {
         nvKmsKapiLogDeviceDebug(device,
             "Failed to enable nonstall event notification");
         nvRmApiFree(device->hRmClient,
