@@ -33,7 +33,6 @@
 #include "class/cl0005.h"
 #include "class/cl2080.h" /* cl2080_notification.h: NV2080_NOTIFIERS_FIFO_EVENT_MTHD */
 #include "ctrl/ctrl00da.h"
-#include "ctrl/ctrl2080/ctrl2080event.h" /* NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION */
 
 struct NvKmsKapiChannelEvent {
     struct NvKmsKapiDevice *device;
@@ -90,13 +89,10 @@ static void FreeChannelEventNonStall
     }
 
     /*
-     * Do NOT send NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION(DISABLE) here: the
-     * notifyActions[] arming state lives on the shared subdevice object
-     * (subdevice_ctrl_event_kernel.c), so disabling it would silence every
-     * other fence context's event on this device. Freeing the event object is
-     * sufficient - it removes this callback from the engine notification
-     * list. The subdevice-level arming intentionally stays REPEAT for the
-     * device's lifetime (see AllocChannelEventNonStall).
+     * Nothing to disarm -- registration never armed the subdevice (see
+     * AllocChannelEventNonStall). Freeing the event object removes this
+     * callback from the engine notification list, and RM drains any in-flight
+     * notify before the free returns.
      */
     nvRmApiFree(device->hRmClient,
                 device->hRmClient,
@@ -118,7 +114,6 @@ static void AllocChannelEventNonStall
 )
 {
     NV0005_ALLOC_PARAMETERS eventParams = { };
-    NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS setParams = { };
     NvU32 ret;
 
     cb->nonStallRmCallback.func = ChannelEventNonStallHandler;
@@ -151,37 +146,19 @@ static void AllocChannelEventNonStall
         return;
     }
 
-    setParams.event = NV2080_NOTIFIERS_FIFO_EVENT_MTHD;
-    setParams.action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT;
-
-    ret = nvRmApiControl(device->hRmClient,
-                         device->hRmSubDevice,
-                         NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION,
-                         &setParams,
-                         sizeof(setParams));
-
     /*
-     * The notifyActions[] arming is per shared subdevice object, and RM
-     * rejects an armed->armed transition with INVALID_STATE
-     * (subdevice_ctrl_event_kernel.c) - which is exactly what a second fence
-     * context on this device sees, since the first one already armed REPEAT
-     * and teardown deliberately never disables it. That is success for our
-     * purposes: the nonstall engine-list delivery calls every registered
-     * event unconditionally (event_notification.c,
-     * _gpuEngineEventNotificationListNotify), so this context's event fires
-     * as long as it stays allocated. (sem_surf.c registers the identical
-     * event type without any SET_NOTIFICATION at all.)
+     * Deliberately no NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION: nonstall
+     * engine-list delivery (_gpuEngineEventNotificationListNotify) invokes
+     * every registered event unconditionally; the subdevice's notifyActions[]
+     * only gates the stall-path gpuNotifySubDeviceEvent(), which nothing
+     * raises for FIFO_EVENT_MTHD. This matches RM's own semaphore-surface
+     * code, which registers this exact event type on this exact notifier
+     * with no SET_NOTIFICATION at all (sem_surf.c _semsurfRegisterCallback;
+     * ctrl00da.h documents FIFO_EVENT_MTHD as a semsurf bind index). Arming
+     * would also be shared subdevice-object state (armed->armed returns
+     * INVALID_STATE), which is a multi-context trap a previous revision of
+     * this code fell into.
      */
-    if (ret != NVOS_STATUS_SUCCESS &&
-        ret != NVOS_STATUS_ERROR_INVALID_STATE) {
-        nvKmsKapiLogDeviceDebug(device,
-            "Failed to enable nonstall event notification");
-        nvRmApiFree(device->hRmClient,
-                    device->hRmClient,
-                    cb->hNonStallCallback);
-        nvFreeUnixRmHandle(&device->handleAllocator, cb->hNonStallCallback);
-        cb->hNonStallCallback = 0;
-    }
 }
 
 void nvKmsKapiFreeChannelEvent

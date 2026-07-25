@@ -55,21 +55,14 @@
  * its threshold already passed, on an idle timeline) is closed at zero latency
  * because .update drains against the live payload at attach.
  *
- * Accepted delta vs the old 8 ms poll: on an *idle* timeline a genuinely lost
- * (not merely late) channel event is now recovered by the timeout timer rather
- * than a poll, so such a fence completes with -ETIMEDOUT after up to
- * NV_DRM_FENCE_MAX_TIMEOUT_MS instead of an 8 ms/success re-check. NVIDIA
- * channel events are reliable in practice, and on an active timeline the next
- * event/attach drains it within a frame, so this is a corner case; the win is
- * no per-frame poll wakeups and one shared engine.
- *
  * PATCH(prime-nonstall-wakeup) [gt4o4 fork]:
  *
- * The corner case above turned out to be real on GSP systems: the prime
- * channel event originates in GSP-RM firmware (POST_EVENT RPC), and losing it
+ * Genuinely losing a channel event is real on GSP systems: the prime channel
+ * event originates in GSP-RM firmware (POST_EVENT RPC), and losing the one
  * for the last frame before the timeline goes idle left the fence stalled on
- * the 5 s timer (observed as occasional multi-second reverse-PRIME freezes
- * that self-recover). Two changes:
+ * the timeout timer (observed as occasional multi-second reverse-PRIME
+ * freezes that self-recover; measured at ~1 lost event per 12,000 on GA104).
+ * Two changes:
  *
  *   - The KAPI (nvkms-kapi-sync.c) now additionally registers a subdevice
  *     nonstall-interrupt callback (FIFO_EVENT_MTHD) for the same consumer,
@@ -854,8 +847,9 @@ static void __nv_drm_prime_fence_context_destroy(
         to_nv_prime_fence_context(nv_fence_context);
 
     /*
-     * Free channel event before idling the engine, otherwise event callbacks
-     * (which re-arm the timer) continue to get called.
+     * Free the event callbacks before idling the engine, otherwise their
+     * handlers (which drain the pending list and enqueue worker work, and
+     * dereference this context) continue to get called.
      */
     nvKms->freeChannelEvent(nv_dev->pDevice, nv_prime_fence_context->cb);
 
@@ -1726,10 +1720,7 @@ static struct dma_fence *__nv_drm_semsurf_fence_ctx_create_fence(
     struct dma_fence *fence;
     int ret = 0;
 
-    if (timeout_value_ms == 0 ||
-        timeout_value_ms > NV_DRM_FENCE_MAX_TIMEOUT_MS) {
-        timeout_value_ms = NV_DRM_FENCE_MAX_TIMEOUT_MS;
-    }
+    /* timeout_value_ms is clamped by __nv_drm_fence_context_add_pending(). */
 
     if ((nv_fence = nv_drm_calloc(1, sizeof(*nv_fence))) == NULL) {
         ret = -ENOMEM;
