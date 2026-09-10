@@ -40,8 +40,8 @@
 
 namespace DisplayPort
 {
-    #define PREDEFINED_DSC_MST_BPPX16 160;
-    #define MAX_DSC_COMPRESSION_BPPX16 128;
+    #define PREDEFINED_DSC_MST_BPPX16 192; // PATCH: MST DSC default -> 12.0 bpp (10-bpc advertise patch dropped, so the ViewSonic runs uncompressed: 48+15 = 63/63 slots exactly); falls back to MAX_DSC_COMPRESSION if it does not fit
+    #define MAX_DSC_COMPRESSION_BPPX16 160; // PATCH: fallback/max-compression floor 8.0 -> 10.0 bpp (never compress D1 below the current known-good 10 bpp)
     #define HDCP_BCAPS_DDC_OFFSET 0x40
     #define HDCP_BCAPS_DDC_EN_BIT 0x80
     #define HDCP_BCAPS_DP_EN_BIT  0x01
