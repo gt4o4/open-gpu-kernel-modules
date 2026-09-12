@@ -21,7 +21,7 @@
  */
 
 /*
- * PATCH(fence-unify) [gt4o4 fork, vs upstream 610.43.03]
+ * PATCH(fence-unify) [gt4o4 fork, vs upstream 615.71.09; first written against 610.43.03]
  *
  * This file exposes two dma-fence classes to userspace, both unchanged at the
  * ioctl/UAPI level:
